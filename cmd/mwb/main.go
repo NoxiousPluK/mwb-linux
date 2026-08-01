@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -218,6 +217,7 @@ func main() {
 				slog.Info("screen detected", "width", screen.Width, "height", screen.Height)
 
 				cap = capture.New(conn, screen, *edgeSide)
+				cap.SetCaptureBackend(cfg.CaptureBackend)
 				// Wire remote screen dimensions from config so virtual cursor
 				// coordinate mapping is correct for non-1080p Windows displays.
 				cap.SetRemoteScreen(int32(cfg.RemoteWidth), int32(cfg.RemoteHeight))
@@ -236,12 +236,10 @@ func main() {
 				handler.OnActivated = func() {
 					cap.SetActive(true)
 					go func() {
-						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-						defer cancel()
 						entryX, entryY := cap.SafeEntryPosition()
-						_ = exec.CommandContext(ctx, "xdotool", "mousemove", "--",
-							fmt.Sprintf("%d", entryX),
-							fmt.Sprintf("%d", entryY)).Run()
+						if err := cap.Reenter(entryX, entryY); err != nil {
+							slog.Warn("reenter cursor placement failed", "err", err)
+						}
 					}()
 				}
 
@@ -251,11 +249,9 @@ func main() {
 					cap.SetActive(true)
 					// Move cursor to center so it doesn't immediately re-trigger edge
 					go func() {
-						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-						defer cancel()
-						_ = exec.CommandContext(ctx, "xdotool", "mousemove", "--",
-							fmt.Sprintf("%d", screen.Width/2),
-							fmt.Sprintf("%d", screen.Height/2)).Run()
+						if err := cap.Reenter(screen.Width/2, screen.Height/2); err != nil {
+							slog.Warn("reenter cursor placement failed", "err", err)
+						}
 					}()
 				}
 

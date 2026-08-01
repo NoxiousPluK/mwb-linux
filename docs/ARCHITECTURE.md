@@ -415,7 +415,7 @@ all writes.
 
 - [ ] File drag-and-drop
 - [ ] Multi-monitor support
-- [ ] Wayland native support (replace xdotool with compositor protocol)
-- [ ] Replace xdotool polling with XInput2 RawMotion events (100 forks/sec → 0)
+- [x] Wayland native edge detection (`org.freedesktop.portal.InputCapture`, `wayland_portal` build tag — see `internal/capture/edgesource_portal_linux.go` and CONTRIBUTING.md's Areas for Contribution for what's still open: EIS-based input forwarding, non-KDE compositor testing)
+- [ ] Replace xdotool polling with XInput2 RawMotion events (100 forks/sec → 0) — only applies to the xdotool backend; the portal backend has no polling loop
 - [ ] Virtual cursor drift correction (wire UpdateRemoteScreen to incoming abs coords)
 - [ ] Smoother cursor transition animations

@@ -44,6 +44,13 @@ type Config struct {
 	// absolute-mirror direction). 1.0 mirrors Windows 1:1; raise it for a faster
 	// local cursor when Windows is in control. <= 0 means unset (defaults to 1).
 	InboundMultiplier float64 `toml:"inbound_multiplier"`
+
+	// CaptureBackend selects how outbound (Linux->Windows) edge detection
+	// works. "auto" (default) picks the best available backend for this
+	// build; "xdotool" forces the X11/XWayland poll; "portal" forces the
+	// xdg-desktop-portal InputCapture backend (only meaningful on binaries
+	// built with the wayland_portal tag — see `make build-wayland`).
+	CaptureBackend string `toml:"capture_backend"`
 }
 
 func Load(path string) (*Config, error) {
@@ -87,6 +94,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Edge == "" {
 		cfg.Edge = "left"
+	}
+	if cfg.CaptureBackend == "" {
+		cfg.CaptureBackend = "auto"
 	}
 
 	// The config holds the plaintext security key — the only secret protecting

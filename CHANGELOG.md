@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Wayland-native edge detection** via the `org.freedesktop.portal.InputCapture`
+  portal (KWin 6.1+, GNOME 46+, wlroots compositors with EIS support),
+  replacing xdotool's cursor polling, which most Wayland compositors don't
+  feed live global pointer position to over XWayland. Opt-in: build with
+  `make build-wayland` (needs `libei-1.0` dev headers and a C toolchain),
+  then set `capture_backend = "portal"` (or leave it `"auto"`). Default
+  builds are unaffected — the backend only compiles in behind the
+  `wayland_portal` tag, so release artifacts stay `CGO_ENABLED=0`.
+
+### Fixed
+- **Pointer devices that split movement and buttons across separate USB
+  interfaces were never isolated or forwarded.** `isGrabTarget` required
+  `BTN_MOUSE` on the same node as `REL_X`/`REL_Y`; some mice (e.g. a
+  Logitech G502 HERO) report movement and buttons on different interfaces
+  entirely. `REL_X` + `REL_Y` alone is now sufficient.
+- **A legitimate `MachineSwitched` return could be rejected indefinitely**
+  if the remote machine's cursor was moved with an input device other than
+  the one that originally drove it there (e.g. its own touchpad) — Linux's
+  local shadow-position tracking has no way to observe that movement. Now
+  accepted after a bounded 3s retry window instead of blocking forever.
+
 ## [0.6.0] - 2026-07-31
 
 ### Added

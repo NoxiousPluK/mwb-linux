@@ -6,3 +6,8 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	golang.org/x/crypto v0.53.0
 )
+
+require (
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+)

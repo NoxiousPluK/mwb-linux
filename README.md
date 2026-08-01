@@ -258,6 +258,7 @@ keep the client on a trusted network segment.
 | `file_dir` | ~/Downloads/mwb | Where received files are written |
 | `max_file_size` | 104857600 | Per-transfer cap in bytes. The default matches MWB's own 100 MB limit; a stock Windows peer neither sends nor accepts more |
 | `keyboard_layout` | auto | Inbound Windows-to-Linux keyboard mapping. `auto` detects the local Linux layout when possible; supported profiles include `us`, `de`, `fr`, `be`, `es`, `it`, `gb`, `pt`, `no`/`dk`/`se`/`fi`, `ch`, and `nl` |
+| `capture_backend` | auto | Outbound (Linux→Windows) edge-detection backend: `xdotool` (X11/XWayland poll) or `portal` (Wayland `InputCapture` portal, needs a `make build-wayland` binary). `auto` prefers the portal when the binary supports it and the compositor exposes it |
 
 > **Config file security:** `config.toml` stores the security key in plaintext.
 > The installer creates it with `0600` permissions (owner-only), and `mwb`
@@ -356,7 +357,7 @@ scripts/
 - **Keyboard on Windows lock screen** — Keyboard input may not work on the Windows lock screen (Winlogon desktop security restriction)
 - **Middle mouse button auto-scroll** — Middle-click auto-scroll (scroll lock mode) does not work in browsers; normal middle-click works
 - **First connection** — Initial handshake takes ~3-16s depending on Windows MWB state; subsequent reconnects are instant
-- **Bidirectional mode requires X11** — Edge detection uses `xdotool`. (Device isolation itself is display-server agnostic: `EVIOCGRAB` works identically on X11, Wayland and the console.) Receive-only mode works on Wayland (XWayland session). Native Wayland bidirectional support requires compositor extensions and is not yet implemented.
+- **Bidirectional edge detection on Wayland needs a build with portal support** — The default binary detects edge crossings via `xdotool`, which needs a real X11 display; most Wayland compositors don't forward live global pointer position to XWayland, so bidi mode is unreliable there (receive-only mode is unaffected — device isolation via `EVIOCGRAB` is display-server agnostic). Compositors implementing the `org.freedesktop.portal.InputCapture` portal (KWin 6.1+, GNOME 46+, wlroots compositors with EIS support) can use the portal backend instead: build with `make build-wayland` (requires `libei-1.0` dev headers and a C toolchain) and set `capture_backend = "portal"` (or leave it `"auto"` to prefer the portal when available). The first run shows a one-time compositor permission dialog; approval is remembered across restarts. See [CONTRIBUTING.md](CONTRIBUTING.md) for how it's implemented.
 - **Keyboard layout metadata** — PowerToys MWB keyboard packets carry Windows virtual-key codes and flags, but not hardware scan codes or Unicode text. MWB Linux uses `keyboard_layout` profiles for common layouts; unsupported profiles fall back to the original US-compatible mapping. Fully zero-config global layout support requires sender-side scan code or Unicode metadata.
 - **File copy is one file at a time** — Matching MWB itself, folders and
   multi-file selections are not transferred; zip them first. The 100 MB default
@@ -377,10 +378,11 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 ### Building
 
 ```bash
-make build    # Build binary
-make test     # Run tests
-make lint     # Run linter
-make check    # All of the above
+make build         # Build binary
+make build-wayland # Build with the Wayland InputCapture portal backend (needs libei-1.0 dev headers)
+make test          # Run tests
+make lint          # Run linter
+make check         # All of the above
 ```
 
 ## Acknowledgments

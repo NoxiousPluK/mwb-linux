@@ -3,9 +3,32 @@
 package capture
 
 import (
+	"context"
 	"testing"
 	"time"
 )
+
+// fakeEdgeSource is a test double for EdgeSource: records calls instead of
+// touching real hardware or a display server.
+type fakeEdgeSource struct {
+	activatedCount int
+	reenterCalls   [][2]int32
+	reenterErr     error
+}
+
+func (f *fakeEdgeSource) Run(ctx context.Context, _ func(y int32)) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (f *fakeEdgeSource) Reenter(x, y int32) error {
+	f.reenterCalls = append(f.reenterCalls, [2]int32{x, y})
+	return f.reenterErr
+}
+
+func (f *fakeEdgeSource) NotifyActivated() { f.activatedCount++ }
+
+func (f *fakeEdgeSource) Close() error { return nil }
 
 // --- applyAcceleration ---
 
@@ -130,6 +153,52 @@ func TestAcceptsActivation_RightEdgeOnlyAcceptsRemoteLeftEdge(t *testing.T) {
 	}
 }
 
+func TestAcceptsActivation_AcceptsAfterRetryTimeout(t *testing.T) {
+	c := &Capturer{active: false, edgeSide: "left", remoteW: 1920, remoteX: 0}
+	if c.AcceptsActivation() {
+		t.Fatal("first rejection should still reject (protects against a same-instant spurious bounce)")
+	}
+	if c.activationRejectedSince.IsZero() {
+		t.Fatal("a rejection should start the retry-timeout clock")
+	}
+
+	// Still within the timeout window and the shadow position hasn't moved:
+	// must keep rejecting.
+	if c.AcceptsActivation() {
+		t.Fatal("should keep rejecting while within activationRetryTimeout")
+	}
+
+	// Simulate the timeout having elapsed (Windows kept retrying past
+	// activationRetryTimeout — a stuck return, not a spurious one).
+	c.activationRejectedSince = time.Now().Add(-activationRetryTimeout - time.Second)
+	if !c.AcceptsActivation() {
+		t.Fatal("should accept once the remote has been retrying past activationRetryTimeout")
+	}
+	if !c.activationRejectedSince.IsZero() {
+		t.Fatal("accepting should reset the rejection-streak clock")
+	}
+}
+
+func TestAcceptsActivation_OnSharedEdgeResetsRejectionStreak(t *testing.T) {
+	c := &Capturer{active: false, edgeSide: "left", remoteW: 1920, remoteX: 0}
+	if c.AcceptsActivation() {
+		t.Fatal("expected initial rejection")
+	}
+	if c.activationRejectedSince.IsZero() {
+		t.Fatal("expected a rejection streak to have started")
+	}
+
+	// The shadow position now legitimately reaches the shared edge — should
+	// accept immediately and clear the streak, not wait out the timeout.
+	c.remoteX = 1919
+	if !c.AcceptsActivation() {
+		t.Fatal("expected acceptance once remoteX reaches the shared edge")
+	}
+	if !c.activationRejectedSince.IsZero() {
+		t.Fatal("accepting on a shared-edge match should reset the rejection streak")
+	}
+}
+
 // --- SetActive mutex invariant ---
 
 // SetActive must NOT hold c.mu when calling applyIsolation.
@@ -160,28 +229,31 @@ func TestSetActive_NoDeadlockOnActivate(t *testing.T) {
 }
 
 func TestSetActive_ResetsGatesOnActivate(t *testing.T) {
+	edge := &fakeEdgeSource{}
 	c := &Capturer{
-		active:    false,
-		canSwitch: true,
-		canReturn: true,
-		stopCh:    make(chan struct{}),
-		remoteW:   1920,
-		remoteH:   1080,
+		active:     false,
+		canReturn:  true,
+		stopCh:     make(chan struct{}),
+		remoteW:    1920,
+		remoteH:    1080,
+		edgeSource: edge,
 	}
 	c.SetActive(true)
 
 	c.mu.Lock()
-	cs := c.canSwitch
 	cr := c.canReturn
 	c.mu.Unlock()
 
-	// Both gates must be reset on activation — prevents immediate re-trigger
-	// of the edge switch before the cursor moves away from the edge.
-	if cs {
-		t.Error("canSwitch must be false after SetActive(true) — cursor is at edge, must move away first")
-	}
+	// canReturn must be reset on activation — prevents ghost bounce on
+	// reconnect. The edge-switch re-arm gate now lives inside the
+	// EdgeSource; SetActive notifies it via NotifyActivated instead of
+	// touching a shared field directly, so the switch-out debounce doesn't
+	// race the caller's cursor-reentry warp.
 	if cr {
 		t.Error("canReturn must be false after SetActive(true) — prevents ghost bounce on reconnect")
+	}
+	if edge.activatedCount != 1 {
+		t.Errorf("edgeSource.NotifyActivated called %d times, want 1", edge.activatedCount)
 	}
 }
 
@@ -205,39 +277,27 @@ func TestSetActive_NoOpWhenAlreadyActive(t *testing.T) {
 	}
 }
 
-// --- canSwitch / canReturn gates ---
+// --- Reenter passthrough ---
 
-func TestCanSwitchGate_RequiresMoveAwayFromEdge(t *testing.T) {
-	c := &Capturer{
-		active:    true,
-		canSwitch: false, // just activated — must move away from edge first
-		edgeSide:  "left",
-		screen:    ScreenInfo{Width: 2560, Height: 1440},
-	}
-
-	const edgeZone = int32(20)
-
-	// Simulate cursor at x=0 (edge) — canSwitch should NOT arm
-	c.mu.Lock()
-	if 0 > edgeZone {
-		c.canSwitch = true
-	}
-	armed := c.canSwitch
-	c.mu.Unlock()
-
-	if armed {
-		t.Error("canSwitch should not arm when cursor is at x=0 (the edge)")
-	}
-
-	// Simulate cursor moving to x=100 — canSwitch should arm
-	c.mu.Lock()
-	if 100 > edgeZone {
-		c.canSwitch = true
-	}
-	armed = c.canSwitch
-	c.mu.Unlock()
-
-	if !armed {
-		t.Error("canSwitch should arm when cursor moves 100px away from edge")
+func TestReenter_NoEdgeSourceConfigured(t *testing.T) {
+	c := &Capturer{}
+	if err := c.Reenter(100, 100); err == nil {
+		t.Error("Reenter should error when Run hasn't set up an edgeSource yet")
 	}
 }
+
+func TestReenter_DelegatesToEdgeSource(t *testing.T) {
+	edge := &fakeEdgeSource{}
+	c := &Capturer{edgeSource: edge}
+	if err := c.Reenter(42, 7); err != nil {
+		t.Fatalf("Reenter returned error: %v", err)
+	}
+	if len(edge.reenterCalls) != 1 || edge.reenterCalls[0] != [2]int32{42, 7} {
+		t.Errorf("edgeSource.Reenter calls = %v, want [[42 7]]", edge.reenterCalls)
+	}
+}
+
+// --- canReturn gate ---
+//
+// The canSwitch/edgeZone re-arm gate now lives in xdotoolEdgeSource (see
+// edgesource_xdotool_linux_test.go for shouldArm/crossedEdge coverage).

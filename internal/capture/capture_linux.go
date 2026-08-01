@@ -51,6 +51,14 @@ const (
 	// MachineSwitched notification at the entry position can bounce straight
 	// back before the cursor reaches the real shared edge.
 	remoteReturnMargin = 64
+
+	// activationRetryTimeout bounds how long AcceptsActivation keeps
+	// rejecting a MachineSwitched that doesn't match our (possibly stale)
+	// shadow position. Long enough to still reject a same-instant spurious
+	// double-fire; short enough that a genuinely stuck return self-heals
+	// within one of Windows' own retry cycles rather than needing the
+	// Ctrl+Alt+Right hotkey or a restart.
+	activationRetryTimeout = 3 * time.Second
 )
 
 type inputEvent struct {
@@ -67,33 +75,58 @@ type ScreenInfo struct {
 	Height int32
 }
 
+// EdgeSource supplies local-cursor edge-crossing detection and reentry
+// placement, independent of display server. xdotoolEdgeSource polls X11 via
+// xdotool; portalEdgeSource (behind the wayland_portal build tag) uses the
+// xdg-desktop-portal InputCapture API for native Wayland compositors.
+type EdgeSource interface {
+	// Run blocks until ctx is done, invoking onCross(y) each time the local
+	// cursor crosses the configured edge while active.
+	Run(ctx context.Context, onCross func(y int32)) error
+	// Reenter places the local cursor at (x, y). Called when control returns
+	// from the remote machine so the cursor doesn't stay pinned to the
+	// switch edge (see ARCHITECTURE.md's cursor-position invariant).
+	Reenter(x, y int32) error
+	// NotifyActivated is called whenever this machine regains cursor
+	// ownership (via SetActive), before any Reenter placement has
+	// necessarily taken effect. Poll-based implementations (xdotool) use
+	// this to re-arm debounce state so they don't immediately re-trigger
+	// against the stale pre-warp cursor position; push-based
+	// implementations may no-op.
+	NotifyActivated()
+	Close() error
+}
+
 // Capturer monitors input and forwards events to the remote MWB host.
 type Capturer struct {
-	conn          *network.Conn
-	screen        ScreenInfo
-	active        bool   // true = cursor is on this machine
-	edgeSide      string // "left" or "right"
-	mu            sync.Mutex
-	grabMu        sync.Mutex                 // serializes isolation changes; never held with mu
-	setGrabFn     func(*os.File, bool) error // test seam; nil uses the real ioctl
-	findDevicesFn func() ([]string, error)   // test seam; nil scans /dev/input
-	stopCh        chan struct{}
-	wg            sync.WaitGroup            // tracks all goroutines for clean Stop()
-	devices       map[string]*trackedDevice // open /dev/input/event* fds, keyed by path
-	stopped       bool                      // set by Stop(); blocks new goroutines racing wg.Wait
-	lastSwitch    time.Time                 // debounce outgoing switches
-	switchSent    time.Time                 // when we last sent switch packets
-	lastActivated time.Time                 // when cursor last arrived on this machine
-	remoteX       int32                     // virtual cursor position on remote (pixels)
-	remoteY       int32                     // virtual cursor position on remote (pixels)
-	remoteW       int32                     // detected remote screen width
-	remoteH       int32                     // detected remote screen height
-	accelMult     float64                   // scaling applied to raw evdev deltas (config: accel_multiplier)
-	edgeY         int32                     // Y position where cursor left local screen
-	canSwitch     bool                      // true once cursor has been away from edge since activation
-	canReturn     bool                      // true once cursor has moved away from the remote return edge
-	hotkeyCtrl    bool                      // tracks Ctrl key state for hotkey detection
-	hotkeyAlt     bool                      // tracks Alt key state for hotkey detection
+	conn                    *network.Conn
+	screen                  ScreenInfo
+	active                  bool   // true = cursor is on this machine
+	edgeSide                string // "left" or "right"
+	mu                      sync.Mutex
+	grabMu                  sync.Mutex                 // serializes isolation changes; never held with mu
+	setGrabFn               func(*os.File, bool) error // test seam; nil uses the real ioctl
+	findDevicesFn           func() ([]string, error)   // test seam; nil scans /dev/input
+	stopCh                  chan struct{}
+	wg                      sync.WaitGroup            // tracks all goroutines for clean Stop()
+	devices                 map[string]*trackedDevice // open /dev/input/event* fds, keyed by path
+	stopped                 bool                      // set by Stop(); blocks new goroutines racing wg.Wait
+	lastSwitch              time.Time                 // debounce outgoing switches
+	switchSent              time.Time                 // when we last sent switch packets
+	lastActivated           time.Time                 // when cursor last arrived on this machine
+	remoteX                 int32                     // virtual cursor position on remote (pixels)
+	remoteY                 int32                     // virtual cursor position on remote (pixels)
+	remoteW                 int32                     // detected remote screen width
+	remoteH                 int32                     // detected remote screen height
+	accelMult               float64                   // scaling applied to raw evdev deltas (config: accel_multiplier)
+	edgeY                   int32                     // Y position where cursor left local screen
+	canReturn               bool                      // true once cursor has moved away from the remote return edge
+	hotkeyCtrl              bool                      // tracks Ctrl key state for hotkey detection
+	hotkeyAlt               bool                      // tracks Alt key state for hotkey detection
+	edgeSource              EdgeSource                // nil until Run(); resolved via selectEdgeSource
+	edgeCancel              context.CancelFunc        // stops the edgeSource's Run goroutine
+	backendName             string                    // capture_backend config value; "" == "auto"
+	activationRejectedSince time.Time                 // start of the current AcceptsActivation rejection streak; zero if none
 }
 
 // trackedDevice is one open /dev/input/event* node.
@@ -116,7 +149,6 @@ func New(conn *network.Conn, screen ScreenInfo, edgeSide string) *Capturer {
 		remoteW:   defaultRemoteWidth,
 		remoteH:   defaultRemoteHeight,
 		accelMult: defaultAccelMultiplier,
-		canSwitch: true, // allow first switch immediately
 	}
 }
 
@@ -132,15 +164,25 @@ func (c *Capturer) SetActive(active bool) {
 	if shouldEnable {
 		c.switchSent = time.Time{}
 		c.lastActivated = time.Now()
-		c.canSwitch = false // must move away from local edge before next outbound switch
 		c.canReturn = false // must move away from remote edge before next return switch
 	}
 	c.mu.Unlock()
 	// applyIsolation acquires c.mu internally — must be called after unlock.
 	// Calling it under the lock caused a deadlock that froze all goroutines.
 	if shouldEnable {
+		if c.edgeSource != nil {
+			c.edgeSource.NotifyActivated()
+		}
 		c.applyIsolation()
 	}
+}
+
+// SetCaptureBackend selects which EdgeSource implementation Run will use:
+// "auto" (default), "xdotool", or "portal" (only meaningful on binaries
+// built with the wayland_portal tag; see selectEdgeSource). Must be called
+// before Run — it only takes effect the first time Run resolves edgeSource.
+func (c *Capturer) SetCaptureBackend(name string) {
+	c.backendName = name
 }
 
 // IsActive returns true if cursor is on this machine.
@@ -188,6 +230,21 @@ func (c *Capturer) AcceptsReclaim(requestX int32) bool {
 // compatible with the edge this Linux screen shares with the remote. Windows can
 // emit MachineSwitched from the remote machine's far edge if its matrix wraps or
 // is rotated; that must not bring local control back.
+//
+// MachineSwitched carries no position data on the wire (confirmed against
+// upstream PowerToys: it's sent as a bare notification, originally just a
+// clipboard-context hint) — the "shared edge" check above is Linux's own
+// approximation, built entirely from replaying local evdev deltas while c
+// was active outbound. That shadow position only advances when *our*
+// physical device drives the remote cursor. If the remote user switches to
+// a different input device once control has landed there (its own
+// touchpad, say), our shadow position freezes and this check would reject
+// a perfectly legitimate return forever — Windows has no channel to tell us
+// its real position while it's the active machine, so there's no wire-level
+// fix. Reject a first rejection immediately (preserves the fast-spurious-
+// bounce protection this check was added for), but if the remote keeps
+// asking past activationRetryTimeout, accept it: that's a stuck return, not
+// a spurious one.
 func (c *Capturer) AcceptsActivation() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -201,14 +258,29 @@ func (c *Capturer) AcceptsActivation() bool {
 		remoteW = defaultRemoteWidth
 	}
 
+	var onSharedEdge bool
 	switch c.edgeSide {
 	case "left":
-		return c.remoteX >= remoteW-remoteReturnMargin
+		onSharedEdge = c.remoteX >= remoteW-remoteReturnMargin
 	case "right":
-		return c.remoteX <= remoteReturnMargin
+		onSharedEdge = c.remoteX <= remoteReturnMargin
 	default:
+		onSharedEdge = true
+	}
+
+	if onSharedEdge {
+		c.activationRejectedSince = time.Time{}
 		return true
 	}
+	if c.activationRejectedSince.IsZero() {
+		c.activationRejectedSince = time.Now()
+		return false
+	}
+	if time.Since(c.activationRejectedSince) >= activationRetryTimeout {
+		c.activationRejectedSince = time.Time{}
+		return true
+	}
+	return false
 }
 
 // UpdateRemoteScreen detects remote screen dimensions from incoming Mouse packets.
@@ -252,6 +324,9 @@ func (c *Capturer) SetAccelMultiplier(m float64) {
 // the machine with no mouse and no keyboard.
 func (c *Capturer) Stop() {
 	close(c.stopCh)
+	if c.edgeCancel != nil {
+		c.edgeCancel()
+	}
 	// Close all device fds to unblock any goroutines stuck in f.Read().
 	// Without this, monitorDevice goroutines block indefinitely and accumulate
 	// across reconnect cycles (35 devices × N reconnects = goroutine storm).
@@ -263,9 +338,12 @@ func (c *Capturer) Stop() {
 	c.devices = nil
 	c.mu.Unlock()
 	c.wg.Wait()
+	if c.edgeSource != nil {
+		_ = c.edgeSource.Close()
+	}
 }
 
-// Run starts edge detection polling and evdev monitoring.
+// Run starts edge detection and evdev monitoring.
 // Validates all preconditions before starting any goroutines.
 func (c *Capturer) Run() error {
 	devices, err := findInputDevices()
@@ -274,10 +352,17 @@ func (c *Capturer) Run() error {
 	}
 	slog.Info("found input devices", "count", len(devices))
 
+	if c.edgeSource == nil {
+		c.edgeSource = selectEdgeSource(c.backendName, c.screen, c.edgeSide)
+	}
+	edgeCtx, edgeCancel := context.WithCancel(context.Background())
+	c.edgeCancel = edgeCancel
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.pollCursorEdge()
+		if err := c.edgeSource.Run(edgeCtx, c.switchToRemote); err != nil {
+			slog.Warn("edge source stopped", "err", err)
+		}
 	}()
 	for _, d := range devices {
 		c.addDevice(d)
@@ -394,125 +479,79 @@ func (c *Capturer) refreshDevices() {
 }
 
 // pollCursorEdge checks the actual cursor position and triggers switches.
-func (c *Capturer) pollCursorEdge() {
-	slog.Info("edge polling started", "edge", c.edgeSide, "screenWidth", c.screen.Width)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	errCount := 0
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			if !c.IsActive() {
-				continue
-			}
-			c.mu.Lock()
-			// canSwitch gate handles loop prevention — no time-based cooldown needed
-			c.mu.Unlock()
-			x, y, err := getCursorPosition()
-			if err != nil {
-				errCount++
-				if errCount <= 3 {
-					slog.Warn("getCursorPosition failed", "err", err, "count", errCount)
-				}
-				continue
-			}
-			if errCount > 0 {
-				errCount = 0
-			}
-
-			// Track whether cursor has been away from the edge since activation
-			// This prevents loops: cursor must move inward first, then back to edge
-			c.mu.Lock()
-			edgeZone := int32(20) // pixels from edge — must move this far inward to re-arm
-			switch c.edgeSide {
-			case "left":
-				if x > edgeZone {
-					c.canSwitch = true
-				}
-			case "right":
-				if x < c.screen.Width-edgeZone {
-					c.canSwitch = true
-				}
-			}
-			canSwitch := c.canSwitch
-			c.mu.Unlock()
-
-			switched := false
-			if canSwitch {
-				switch c.edgeSide {
-				case "left":
-					if x <= 1 {
-						switched = true
-					}
-				case "right":
-					if x >= c.screen.Width-1 {
-						switched = true
-					}
-				}
-			}
-
-			if switched {
-				now := time.Now()
-				if now.Sub(c.lastSwitch) < 100*time.Millisecond {
-					continue
-				}
-				c.lastSwitch = now
-
-				slog.Info("screen edge hit, switching to remote", "edge", c.edgeSide, "x", x, "y", y)
-
-				// Map local Y to remote entry point (proportional)
-				entryY := int32(float64(y) / float64(c.screen.Height) * 65535)
-				// Enter 200px inside the remote screen, not at the literal edge.
-				// Entering at exactly 0 or 65535 triggers Windows MWB's own edge
-				// detection immediately, bouncing the cursor straight back.
-				// 200px margin ≈ 200/1920 * 65535 ≈ 6826 units from the edge.
-				const edgeMargin = int32(6826)
-				entryX := edgeMargin // enter from left of remote, slightly inside
-				if c.edgeSide == "left" {
-					entryX = 65535 - edgeMargin // enter from right of remote, slightly inside
-				}
-
-				c.mu.Lock()
-				c.active = false
-				c.switchSent = time.Now()
-				c.edgeY = y
-				// Set virtual cursor offset from the return edge to prevent jitter bounce.
-				// Entry is 200px from the return edge — gives room for mouse momentum.
-				if c.edgeSide == "left" {
-					c.remoteX = c.remoteW - 200
-				} else {
-					c.remoteX = 200
-				}
-				c.remoteY = int32(float64(y) / float64(c.screen.Height) * float64(c.remoteH))
-				c.canReturn = false // must move away from return edge first
-				c.mu.Unlock()
-
-				// Suppress local input (synchronous — one ioctl per device)
-				c.applyIsolation()
-
-				// Send mouse burst to the entry position on remote
-				// Multiple packets help Windows MWB register the switch reliably
-				conn := c.conn
-				go func() {
-					for i := 0; i < 5; i++ {
-						mouse := &protocol.Packet{
-							Type: protocol.Mouse,
-							Src:  conn.MachineID,
-							Des:  conn.RemoteID,
-						}
-						mouse.Mouse.X = entryX
-						mouse.Mouse.Y = entryY
-						mouse.Mouse.DwFlags = protocol.WM_MOUSEMOVE
-						_ = conn.SendPacket(mouse)
-						time.Sleep(5 * time.Millisecond)
-					}
-				}()
-			}
-		}
+// switchToRemote hands control to the remote machine: flips ownership state,
+// suppresses local input, and sends an entry-position mouse burst. y is the
+// local cursor's vertical position at the moment of the edge crossing,
+// reported by whichever EdgeSource detected it. Debounced against
+// c.lastSwitch; single-writer per Capturer (only the active EdgeSource's Run
+// goroutine calls this), so no lock is needed around that check.
+func (c *Capturer) switchToRemote(y int32) {
+	now := time.Now()
+	if now.Sub(c.lastSwitch) < 100*time.Millisecond {
+		return
 	}
+	c.lastSwitch = now
+
+	slog.Info("screen edge hit, switching to remote", "edge", c.edgeSide, "y", y)
+
+	// Map local Y to remote entry point (proportional)
+	entryY := int32(float64(y) / float64(c.screen.Height) * 65535)
+	// Enter 200px inside the remote screen, not at the literal edge.
+	// Entering at exactly 0 or 65535 triggers Windows MWB's own edge
+	// detection immediately, bouncing the cursor straight back.
+	// 200px margin ≈ 200/1920 * 65535 ≈ 6826 units from the edge.
+	const edgeMargin = int32(6826)
+	entryX := edgeMargin // enter from left of remote, slightly inside
+	if c.edgeSide == "left" {
+		entryX = 65535 - edgeMargin // enter from right of remote, slightly inside
+	}
+
+	c.mu.Lock()
+	c.active = false
+	c.switchSent = time.Now()
+	c.edgeY = y
+	// Set virtual cursor offset from the return edge to prevent jitter bounce.
+	// Entry is 200px from the return edge — gives room for mouse momentum.
+	if c.edgeSide == "left" {
+		c.remoteX = c.remoteW - 200
+	} else {
+		c.remoteX = 200
+	}
+	c.remoteY = int32(float64(y) / float64(c.screen.Height) * float64(c.remoteH))
+	c.canReturn = false // must move away from return edge first
+	c.mu.Unlock()
+
+	// Suppress local input (synchronous — one ioctl per device)
+	c.applyIsolation()
+
+	// Send mouse burst to the entry position on remote
+	// Multiple packets help Windows MWB register the switch reliably
+	conn := c.conn
+	go func() {
+		for i := 0; i < 5; i++ {
+			mouse := &protocol.Packet{
+				Type: protocol.Mouse,
+				Src:  conn.MachineID,
+				Des:  conn.RemoteID,
+			}
+			mouse.Mouse.X = entryX
+			mouse.Mouse.Y = entryY
+			mouse.Mouse.DwFlags = protocol.WM_MOUSEMOVE
+			_ = conn.SendPacket(mouse)
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+}
+
+// Reenter places the local cursor at (x, y) via the active EdgeSource. Used
+// when control returns from the remote machine so the cursor doesn't stay
+// pinned to the switch edge (see ARCHITECTURE.md's cursor-position
+// invariant).
+func (c *Capturer) Reenter(x, y int32) error {
+	if c.edgeSource == nil {
+		return fmt.Errorf("reenter: no edge source configured (Run not called yet)")
+	}
+	return c.edgeSource.Reenter(x, y)
 }
 
 var (
@@ -643,23 +682,6 @@ func detectAndSetXauthority(display string) {
 	}
 }
 
-func getCursorPosition() (x, y int32, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "xdotool", "getmouselocation")
-	cmd.Env = append(os.Environ(), "DISPLAY="+getDisplay())
-	out, err := cmd.Output()
-	if err != nil {
-		return -1, -1, fmt.Errorf("xdotool: %w", err)
-	}
-	var ix, iy int
-	if _, err = fmt.Sscanf(string(out), "x:%d y:%d", &ix, &iy); err != nil {
-		// Return sentinel -1,-1 to distinguish parse failure from cursor at origin (0,0)
-		return -1, -1, fmt.Errorf("xdotool parse: %w", err)
-	}
-	return int32(ix), int32(iy), nil
-}
-
 // applyIsolation brings the kernel grabs in line with who currently owns the
 // cursor: suppressed while the cursor is on the remote machine, live while it
 // is local.
@@ -721,6 +743,7 @@ func (c *Capturer) setIsolation(grab bool) (changed, total int) {
 			slog.Warn("set input isolation", "device", d.file.Name(), "grab", grab, "err", err)
 			continue
 		}
+		slog.Debug("isolation changed for device", "path", d.file.Name(), "grab", grab)
 		c.mu.Lock()
 		d.grabbed = grab
 		c.mu.Unlock()
@@ -881,7 +904,9 @@ func (c *Capturer) handleRel(ev inputEvent) {
 		c.active = true
 		c.switchSent = time.Time{}
 		c.lastActivated = time.Now()
-		c.canSwitch = false // block re-trigger until cursor moves away from edge
+		if c.edgeSource != nil {
+			c.edgeSource.NotifyActivated() // block re-trigger until cursor moves away from edge
+		}
 		c.mu.Unlock()
 
 		// Move cursor away from edge SYNCHRONOUSLY before releasing the grab.
@@ -895,13 +920,9 @@ func (c *Capturer) handleRel(ev inputEvent) {
 			entryX = c.screen.Width - 100
 		}
 		entryY := int32(float64(remY) / float64(remH) * float64(c.screen.Height))
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		cmd := exec.CommandContext(ctx, "xdotool", "mousemove", "--",
-			fmt.Sprintf("%d", entryX),
-			fmt.Sprintf("%d", entryY))
-		cmd.Env = append(os.Environ(), "DISPLAY="+getDisplay())
-		_ = cmd.Run()
-		cancel()
+		if err := c.Reenter(entryX, entryY); err != nil {
+			slog.Warn("reenter cursor placement failed", "err", err)
+		}
 
 		c.applyIsolation()
 		c.mu.Lock()
