@@ -124,9 +124,21 @@ func isGrabTarget(f *os.File) bool {
 		return false
 	}
 
-	// Relative pointer: REL_X + REL_Y + BTN_MOUSE, matching udev's is_mouse.
+	// Relative pointer: REL_X + REL_Y. Originally also required BTN_MOUSE on
+	// the same node (matching udev's is_mouse), but some mice split
+	// movement and buttons across separate HID interfaces/report
+	// descriptors — e.g. a Logitech G502 HERO's primary interface reports
+	// REL_X/REL_Y plus its onboard macro buttons as generic KEY_FILE..
+	// KEY_FORWARD codes (144-159), with BTN_LEFT/BTN_MOUSE (0x110) never
+	// appearing on that node at all; the actual clicks arrive on a second,
+	// separately-enumerated "keyboard" interface. That left the movement
+	// node unclassified — ungrabbed, and unforwarded, while remote — with
+	// clicks alone still going through. REL_X+REL_Y together is already an
+	// unambiguous mouse/trackball signal in practice (unlike absolute axes,
+	// which joysticks and gamepads also report), so BTN_MOUSE isn't needed
+	// here to rule out non-pointer devices.
 	if relBits, err := capabilityBits(f, evRel, relMax); err == nil {
-		if testBit(relBits, relX) && testBit(relBits, relY) && testBit(keyBits, btnMouse) {
+		if testBit(relBits, relX) && testBit(relBits, relY) {
 			return true
 		}
 	}
