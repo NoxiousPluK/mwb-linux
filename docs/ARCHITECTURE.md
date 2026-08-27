@@ -36,9 +36,11 @@ sequenceDiagram
     rect rgb(236, 244, 255)
         note over L,W: 1 · TCP connect + encryption
         L->>W: TCP dial :15101
+        L->>W: 32-byte header (16B PBKDF2 salt + 16B AES IV)
+        W->>L: 32-byte header (16B PBKDF2 salt + 16B AES IV)
+        note over L,W: AES-256-CBC streams up
         L->>W: 16-byte IV seed
         W->>L: 16-byte IV seed
-        note over L,W: AES-256-CBC streams up
     end
     rect rgb(240, 255, 240)
         note over L,W: 2 · Handshake
@@ -59,9 +61,19 @@ sequenceDiagram
     end
 ```
 
-**Key derivation**: `PBKDF2(SHA512, securityKey, UTF16LE("18446744073709551615"), 50000 iterations) → 32-byte AES key`
+**Key derivation** (PowerToys 0.101+): each direction opens with a 32-byte
+cleartext header — a random 16-byte PBKDF2 salt followed by the random 16-byte
+AES IV for that direction. A peer writes its own header before reading the
+other's, since PowerToys creates its two streams lazily and may read before it
+writes. The key is then
+`PBKDF2(SHA512, securityKey, headerSalt, 100000 iterations) → 32-byte AES key`.
 
-**Fixed IV**: ASCII bytes of `"1844674407370955"` (first 16 chars of uint64.MaxValue)
+**Legacy key derivation** (PowerToys 0.100.2 and older): no header; salt and IV
+are both fixed at build time and derivation runs at 50,000 iterations —
+`PBKDF2(SHA512, securityKey, UTF16LE("18446744073709551615"), 50000 iterations)`
+with the IV being the ASCII bytes of `"1844674407370955"` (first 16 chars of
+uint64.MaxValue). Set `legacy_crypto = true` for a Windows peer pinned to such a
+build.
 
 ## Cursor Switching Protocol
 
