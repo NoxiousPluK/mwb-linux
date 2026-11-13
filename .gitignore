@@ -7,8 +7,8 @@
 # Local-only (personal notes, scratch, working docs)
 .local/
 
-# Claude / AI settings
-CLAUDE.md
+# Agent / AI settings
+AGENT.md
 .claude/
 .serena/
 .cursor/
