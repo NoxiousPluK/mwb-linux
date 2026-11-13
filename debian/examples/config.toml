@@ -11,3 +11,10 @@ name = "linux"                # This machine's name (max 15 chars)
 # clipboard = true            # Set false to disable clipboard sync
 # accel_multiplier = 2.0      # Linux -> Windows cursor speed
 # inbound_multiplier = 1.0    # Windows -> Linux cursor speed
+# capture_backend = "auto"    # Outbound edge detection: "xdotool" (X11/XWayland
+#                             # polling) or "portal" (Wayland InputCapture portal,
+#                             # needs a `make build-wayland` binary). "auto" prefers
+#                             # the portal when both binary and compositor support it.
+# legacy_crypto = false       # Speak the stream encryption PowerToys used before
+#                             # 0.101 (build-fixed salt and IV, 50,000 PBKDF2
+#                             # iterations). Only for a peer pinned to 0.100.2 or older.

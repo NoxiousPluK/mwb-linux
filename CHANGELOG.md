@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `wayland_portal` tag, so release artifacts stay `CGO_ENABLED=0`.
 
 ### Fixed
+- **Could not connect to PowerToys 0.101 or newer.** PowerToys changed its
+  stream encryption: each direction now opens with a 32-byte cleartext header
+  (a random 16-byte PBKDF2 salt followed by the random 16-byte AES IV for that
+  direction) and derives the key at 100,000 iterations, where older builds used
+  a salt and IV both fixed at build time at 50,000 iterations. There is no
+  negotiation or fallback on the Windows side, so a client speaking the old
+  scheme never completes a handshake at all. The current scheme is now the
+  default; set `legacy_crypto = true` for a peer pinned to 0.100.2 or older.
 - **Pointer devices that split movement and buttons across separate USB
   interfaces were never isolated or forwarded.** `isGrabTarget` required
   `BTN_MOUSE` on the same node as `REL_X`/`REL_Y`; some mice (e.g. a
