@@ -25,6 +25,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   negotiation or fallback on the Windows side, so a client speaking the old
   scheme never completes a handshake at all. The current scheme is now the
   default; set `legacy_crypto = true` for a peer pinned to 0.100.2 or older.
+- **Mouse side buttons (browser back/forward) never reached Windows.** The
+  outbound filter accepted only `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE`, so
+  `BTN_SIDE` and `BTN_EXTRA` were dropped before the button switch and then
+  fell through to the keyboard path, which does not map them either — they
+  vanished with no log line. Only the send direction was affected; the receive
+  path already handled `WM_XBUTTONDOWN`/`WM_XBUTTONUP`.
+- **`Shift`+arrow did not extend a text selection on Windows.** Outbound
+  keyboard packets never set `LLKHF_EXTENDED`, so PowerToys' scan-code lookup
+  resolved the arrows to their numeric-keypad twins. With NumLock off a bare
+  keypad arrow still navigates, which is why plain arrows appeared to work,
+  but `Shift`+keypad suppresses selection rather than extending it. Extended
+  keys are now flagged by evdev code — the arrows share a VK with the keypad
+  digits, and right `Ctrl`/`Alt` with the left pair, so the VK alone cannot
+  tell them apart. Also covers `Home`/`End`/`PageUp`/`PageDown`/`Insert`/
+  `Delete`, right `Ctrl`/`Alt`, keypad `Enter` and `/`, `NumLock`, and the
+  Meta/Menu keys.
 - **Pointer devices that split movement and buttons across separate USB
   interfaces were never isolated or forwarded.** `isGrabTarget` required
   `BTN_MOUSE` on the same node as `REL_X`/`REL_Y`; some mice (e.g. a
