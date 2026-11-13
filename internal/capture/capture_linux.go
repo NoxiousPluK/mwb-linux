@@ -954,37 +954,11 @@ func (c *Capturer) handleKey(ev inputEvent) {
 	}
 
 	// Mouse buttons
-	if ev.Code >= 0x110 && ev.Code <= 0x112 {
+	if ev.Code >= input.BTN_LEFT && ev.Code <= input.BTN_EXTRA {
 		if !c.IsActive() {
-			var flags int32
-			switch ev.Code {
-			case input.BTN_LEFT:
-				switch ev.Value {
-				case 1:
-					flags = protocol.WM_LBUTTONDOWN
-				case 0:
-					flags = protocol.WM_LBUTTONUP
-				default:
-					return
-				}
-			case input.BTN_RIGHT:
-				switch ev.Value {
-				case 1:
-					flags = protocol.WM_RBUTTONDOWN
-				case 0:
-					flags = protocol.WM_RBUTTONUP
-				default:
-					return
-				}
-			case input.BTN_MIDDLE:
-				switch ev.Value {
-				case 1:
-					flags = protocol.WM_MBUTTONDOWN
-				case 0:
-					flags = protocol.WM_MBUTTONUP
-				default:
-					return
-				}
+			flags, buttonID, ok := mouseButtonMessage(ev.Code, ev.Value)
+			if !ok {
+				return
 			}
 			// Use current virtual cursor position so clicks register at the
 			// correct location on Windows, not always at top-left (0,0).
@@ -992,7 +966,7 @@ func (c *Capturer) handleKey(ev inputEvent) {
 			absX := int32(float64(c.remoteX) / float64(c.remoteW) * 65535)
 			absY := int32(float64(c.remoteY) / float64(c.remoteH) * 65535)
 			c.mu.Unlock()
-			c.sendMouse(absX, absY, 0, flags)
+			c.sendMouse(absX, absY, buttonID, flags)
 		}
 		return
 	}
@@ -1015,6 +989,13 @@ func (c *Capturer) handleKey(ev inputEvent) {
 	if ev.Value == 0 {
 		dwFlags = protocol.LLKHF_UP
 	}
+	// Windows resolves an extended key by its 0xE0-prefixed scan code. Without
+	// this bit PowerToys' MapVirtualKey lookup yields the numeric-keypad scan
+	// code for keys like the arrows, so Shift+Left navigates instead of
+	// selecting.
+	if input.IsExtendedKey(ev.Code) {
+		dwFlags |= protocol.LLKHF_EXTENDED
+	}
 
 	pkt := &protocol.Packet{
 		Type: protocol.Keyboard,
@@ -1026,6 +1007,52 @@ func (c *Capturer) handleKey(ev inputEvent) {
 
 	if err := c.conn.SendPacket(pkt); err != nil {
 		slog.Debug("send keyboard failed", "err", err)
+	}
+}
+
+// mouseButtonMessage maps an evdev button code and press value to the MWB
+// window message for it, plus the X-button id that belongs in the packet's
+// WheelDelta field (0 for the three ordinary buttons). PowerToys passes
+// WheelDelta straight into MOUSEINPUT.mouseData, which Win32 requires to be
+// XBUTTON1 or XBUTTON2 for the WM_XBUTTON* messages.
+func mouseButtonMessage(code uint16, value int32) (flags, buttonID int32, ok bool) {
+	var pressed bool
+	switch value {
+	case 1:
+		pressed = true
+	case 0:
+		pressed = false
+	default:
+		return 0, 0, false
+	}
+
+	switch code {
+	case input.BTN_LEFT:
+		if pressed {
+			return protocol.WM_LBUTTONDOWN, 0, true
+		}
+		return protocol.WM_LBUTTONUP, 0, true
+	case input.BTN_RIGHT:
+		if pressed {
+			return protocol.WM_RBUTTONDOWN, 0, true
+		}
+		return protocol.WM_RBUTTONUP, 0, true
+	case input.BTN_MIDDLE:
+		if pressed {
+			return protocol.WM_MBUTTONDOWN, 0, true
+		}
+		return protocol.WM_MBUTTONUP, 0, true
+	case input.BTN_SIDE, input.BTN_EXTRA:
+		buttonID = 1
+		if code == input.BTN_EXTRA {
+			buttonID = 2
+		}
+		if pressed {
+			return protocol.WM_XBUTTONDOWN, buttonID, true
+		}
+		return protocol.WM_XBUTTONUP, buttonID, true
+	default:
+		return 0, 0, false
 	}
 }
 
